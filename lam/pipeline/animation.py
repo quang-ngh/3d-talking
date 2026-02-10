@@ -114,15 +114,25 @@ class AnimationPipeline:
             (N, H, W, 3) rendered video frames
         """
         # Load motion sequence (supports single .pt with frame-first [N, dim] params, no motion dir)
+        cam_params_from_file = None  # [N, 3] = (scale, tx, ty) from .pt if present
         if isinstance(motion_sequence, (str, Path)):
             print(f"Loading motion sequence from {motion_sequence}...")
             motion_params = load_flame_params(motion_sequence, device=self.device)
-            
             if isinstance(motion_params, dict):
+                cam_params_from_file = motion_params.get("cam_params")
+                if cam_params_from_file is not None:
+                    cam_params_from_file = torch.as_tensor(cam_params_from_file, device=self.device)
+                    if cam_params_from_file.dim() == 1:
+                        cam_params_from_file = cam_params_from_file.unsqueeze(0)
                 motion_seq = self._dict_to_motion_sequence(motion_params)
             else:
                 motion_seq = motion_params
         elif isinstance(motion_sequence, dict):
+            cam_params_from_file = motion_sequence.get("cam_params")
+            if cam_params_from_file is not None:
+                cam_params_from_file = torch.as_tensor(cam_params_from_file, device=self.device)
+                if cam_params_from_file.dim() == 1:
+                    cam_params_from_file = cam_params_from_file.unsqueeze(0)
             motion_seq = self._dict_to_motion_sequence(motion_sequence)
         else:
             motion_seq = motion_sequence
@@ -169,9 +179,9 @@ class AnimationPipeline:
         vertices_sequence = torch.stack(vertices_sequence, dim=0)
         print(f"Generated {num_frames} FLAME meshes")
         
-        # Render: mesh rasterization when available, else placeholder
+        # Render: use cam_params [N, 3] from .pt if available, else default camera
         h, w = self.config.output_size
-        frames = self._render_flame_sequence(vertices_sequence, h, w)
+        frames = self._render_flame_sequence(vertices_sequence, h, w, cam_params=cam_params_from_file)
         
         # Save video if path provided
         if output_path is not None:
@@ -186,11 +196,17 @@ class AnimationPipeline:
         vertices_sequence: torch.Tensor,
         height: int,
         width: int,
+        cam_params: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Render FLAME mesh sequence to (N, H, W, 3) frames in [0, 1].
         Uses PyTorch3D mesh rasterization when available; otherwise placeholder.
+        cam_params: optional [N, 3] from .pt file (scale, tx, ty) per frame; same convention
+                    as batch_orth_proj / SMIRK. If provided, vertices are transformed before
+                    rendering and camera is fixed.
         """
+        if vertices_sequence.shape[1] == 1:
+            vertices_sequence = vertices_sequence.squeeze(1)
         N, V, _ = vertices_sequence.shape
         device = vertices_sequence.device
         h, w = int(height), int(width)
@@ -213,18 +229,34 @@ class AnimationPipeline:
 
         try:
             faces = self.flame.faces.to(device)  # (F, 3)
-            # PyTorch3D: +x right, +y up, +z out; FLAME often +y up, +z back. Use simple frontal view.
             verts = vertices_sequence  # (N, V, 3)
-            # Neutral gray vertex colors for visibility
+
+            # Apply cam_params [N, 3] = (scale, tx, ty) from .pt if provided (same as batch_orth_proj)
+            if cam_params is not None and cam_params.shape[0] == N and cam_params.shape[1] >= 3:
+                cam_params = cam_params.to(device).to(verts.dtype)
+                scale = cam_params[:, 0:1].view(N, 1, 1)  # (N, 1, 1)
+                txty = cam_params[:, 1:3].view(N, 1, 2)   # (N, 1, 2)
+                verts = torch.cat([verts[:, :, :2] + txty, verts[:, :, 2:3]], dim=-1)
+                verts = scale * verts
+
+            # Neutral gray vertex colors
             verts_rgb = torch.ones(N, V, 3, device=device, dtype=verts.dtype) * 0.7
             faces_batch = faces.unsqueeze(0).expand(N, -1, -1)  # (N, F, 3)
             meshes = Meshes(verts=verts, faces=faces_batch, textures=TexturesVertex(verts_rgb))
 
-            # Camera: frontal view, camera at (0, 0, 2) looking at origin
-            focal = float(max(h, w)) * 1.2
-            principal = torch.tensor([[w * 0.5, h * 0.5]], device=device, dtype=torch.float32)
-            focal_len = torch.tensor([[focal, focal]], device=device)
+            # Single fixed camera: at (0, 0, 1) looking at origin (mesh after cam_params is centered).
+            # With in_ndc=False, fx/fy and cx/cy are in PIXEL space (not normalized).
+            R = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
+            T = torch.zeros(N, 3, device=device, dtype=torch.float32)
+            T[:, 2] = -1.0  # camera at (0, 0, 1) in world
+            # fx = fy = float(max(h, w))  # focal length in pixels
+            fx, fy = 1.2
+            cx, cy = w / 2.0, h / 2.0   # principal point at image center (pixels)
+            focal_len = torch.tensor([[fx, fy]], device=device, dtype=torch.float32)
+            principal = torch.tensor([[cx, cy]], device=device, dtype=torch.float32)
             cameras = PerspectiveCameras(
+                # R=R,
+                # T=T,
                 focal_length=focal_len,
                 principal_point=principal,
                 device=device,
@@ -237,14 +269,13 @@ class AnimationPipeline:
                 faces_per_pixel=1,
             )
             rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
-            lights = PointLights(device=device, location=[[0.0, 0.0, 3.0]])
+            lights = PointLights(device=device, location=[[0.0, 0.0, 2.0]])
             materials = Materials(device=device, specular_color=[[0.0, 0.0, 0.0]], shininess=0.0)
             shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
             renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
 
             with torch.no_grad():
                 images, fragments = renderer(meshes, materials=materials)
-            # images (N, H, W, 4) RGBA
             rgb = images[..., :3]
             alpha = (fragments.zbuf[..., 0] >= 0).float().unsqueeze(-1)
             frames = rgb * alpha + (1.0 - alpha) * bg_val
