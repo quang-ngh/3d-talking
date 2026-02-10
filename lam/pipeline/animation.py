@@ -136,7 +136,6 @@ class AnimationPipeline:
             motion_seq = self._dict_to_motion_sequence(motion_sequence)
         else:
             motion_seq = motion_sequence
-        
         num_frames = motion_seq.get_num_frames()
         print(f"Animating {num_frames} frames...")
         
@@ -179,9 +178,13 @@ class AnimationPipeline:
         vertices_sequence = torch.stack(vertices_sequence, dim=0)
         print(f"Generated {num_frames} FLAME meshes")
         
-        # Render: use cam_params [N, 3] from .pt if available, else default camera
+        # Render: use cam_params from motion sequence or from loaded file
+        # breakpoint()
+        cam_for_render = motion_seq.cam_params 
+        if cam_for_render is not None and cam_for_render.dim() == 3:
+            cam_for_render = cam_for_render[0].t()  # (1, 3, N) -> (N, 3)
         h, w = self.config.output_size
-        frames = self._render_flame_sequence(vertices_sequence, h, w, cam_params=cam_params_from_file)
+        frames = self._render_flame_sequence(vertices_sequence, h, w, cam_params=cam_for_render)
         
         # Save video if path provided
         if output_path is not None:
@@ -230,14 +233,19 @@ class AnimationPipeline:
         try:
             faces = self.flame.faces.to(device)  # (F, 3)
             verts = vertices_sequence  # (N, V, 3)
-
             # Apply cam_params [N, 3] = (scale, tx, ty) from .pt if provided (same as batch_orth_proj)
             if cam_params is not None and cam_params.shape[0] == N and cam_params.shape[1] >= 3:
                 cam_params = cam_params.to(device).to(verts.dtype)
                 scale = cam_params[:, 0:1].view(N, 1, 1)  # (N, 1, 1)
-                txty = cam_params[:, 1:3].view(N, 1, 2)   # (N, 1, 2)
+                txty = cam_params[:, 1:3].view(N, 1, 2)   # (N, 1, 2) 
                 verts = torch.cat([verts[:, :, :2] + txty, verts[:, :, 2:3]], dim=-1)
                 verts = scale * verts
+                print(verts.shape)
+            else: 
+                verts = verts * 0.5
+
+            verts[:, :, 0] *= -1
+            verts[:, :, -1] *= -1
 
             # Neutral gray vertex colors
             verts_rgb = torch.ones(N, V, 3, device=device, dtype=verts.dtype) * 0.7
@@ -247,16 +255,24 @@ class AnimationPipeline:
             # Single fixed camera: at (0, 0, 1) looking at origin (mesh after cam_params is centered).
             # With in_ndc=False, fx/fy and cx/cy are in PIXEL space (not normalized).
             R = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
-            T = torch.zeros(N, 3, device=device, dtype=torch.float32)
-            T[:, 2] = -1.0  # camera at (0, 0, 1) in world
-            # fx = fy = float(max(h, w))  # focal length in pixels
-            fx, fy = 1.2
+
+            # Apply 180-degree rotation around the y-axis to the mesh by swapping x and z and flipping their sign
+            # (This is typically equivalent to R = diag([-1,1,-1]), but let's construct the rotation matrix)
+            rot180_y = torch.tensor([
+                [ -1.0,  0.0,  0.0],
+                [  0.0,  1.0,  0.0],
+                [  0.0,  0.0, -1.0]
+            ], device=device, dtype=torch.float32)
+            # R = rot180_y.unsqueeze(0).expand(N, -1, -1)  # overrides R above
+
+            T = torch.tensor([[0.0, 0.5, 4]], device=device, dtype=torch.float32).expand(N, -1, -1).squeeze(1)
+            fx = fy = float(max(h, w)) 
             cx, cy = w / 2.0, h / 2.0   # principal point at image center (pixels)
             focal_len = torch.tensor([[fx, fy]], device=device, dtype=torch.float32)
             principal = torch.tensor([[cx, cy]], device=device, dtype=torch.float32)
             cameras = PerspectiveCameras(
-                # R=R,
-                # T=T,
+                R=R,
+                T=T,
                 focal_length=focal_len,
                 principal_point=principal,
                 device=device,
@@ -269,7 +285,7 @@ class AnimationPipeline:
                 faces_per_pixel=1,
             )
             rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
-            lights = PointLights(device=device, location=[[0.0, 0.0, 2.0]])
+            lights = PointLights(device=device, location=[[0.0, 0.0, -2.0]])
             materials = Materials(device=device, specular_color=[[0.0, 0.0, 0.0]], shininess=0.0)
             shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
             renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
@@ -282,6 +298,7 @@ class AnimationPipeline:
             return frames.clamp(0.0, 1.0)
         except Exception as e:
             print(f"[WARNING] Mesh rendering failed ({e}); using placeholder.")
+            print(e)
             return torch.ones(N, h, w, 3, device=device) * 0.5
 
     def _dict_to_motion_sequence(self, params: Dict[str, torch.Tensor]) -> MotionSequence:
@@ -304,6 +321,7 @@ class AnimationPipeline:
             neck_params=params.get("neck_params"),
             eye_params=params.get("eye_params"),
             translation=params.get("translation"),
+            cam_params=params.get("cam_params"),
             fps=params.get("fps", 30),
         )
     

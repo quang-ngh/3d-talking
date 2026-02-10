@@ -23,6 +23,7 @@ class MotionSequence:
         jaw_params: (B, 3, N) jaw rotation per frame
         eye_params: (B, 6, N) eye rotations per frame
         translation: (B, 3, N) translation per frame
+        cam_params: (N, 3) or (1, 3, N) optional (scale, tx, ty) per frame
         fps: Frames per second
     """
     shape_params: torch.Tensor
@@ -32,6 +33,7 @@ class MotionSequence:
     neck_params: Optional[torch.Tensor] = None
     eye_params: Optional[torch.Tensor] = None
     translation: Optional[torch.Tensor] = None
+    cam_params: Optional[torch.Tensor] = None
     fps: int = 30
     
     def get_num_frames(self) -> int:
@@ -228,7 +230,9 @@ def flame_params_frame_first_to_sequence(
         shape_params = s
     else:
         shape_params = torch.zeros(1, n_shape, device=device)
-    
+
+    cam_params = ensure_sequence(params["cam_params"], 3, "cam") if "cam_params" in params else None
+
     expr_params = ensure_sequence(
         params["expr_params"] if "expr_params" in params else torch.zeros(N, n_expr, device=device),
         n_expr, "expr",
@@ -249,6 +253,7 @@ def flame_params_frame_first_to_sequence(
         shape_params=shape_params,
         expr_params=expr_params,
         pose_params=pose_params,
+        cam_params=cam_params,
         jaw_params=jaw_params,
         neck_params=neck_params,
         eye_params=eye_params,
